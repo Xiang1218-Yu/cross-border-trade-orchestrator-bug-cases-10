@@ -72,7 +72,7 @@ export function recordPayment(tenantId: string, input: { invoiceId: string; amou
 export function createApproval(tenantId: string, input: { orderId: string; type: Approval['type']; reason: string }, actor = 'system') { orderFor(tenantId, input.orderId); const approval: Approval = { id: id('APR'), tenantId, orderId: input.orderId, type: input.type, reason: input.reason, status: 'pending', createdAt: now() }; state.approvals.push(approval); record(tenantId, actor, 'approval.created', 'approval', approval.id, undefined, approval); emit(tenantId, 'approval.created', approval.id, approval); return clone(approval); }
 export function decideApproval(tenantId: string, approvalId: string, input: { status: Exclude<ApprovalStatus, 'pending'>; comment?: string }, actor: string) { const approval = assertTenant(state.approvals.find(item => item.id === approvalId) ?? (() => { throw new Error('审批不存在'); })(), tenantId); if (approval.status !== 'pending') throw new Error('审批已经决策'); const before = clone(approval); approval.status = input.status; approval.decidedBy = actor; approval.comment = input.comment; approval.decidedAt = now(); if (input.status === 'approved' && approval.type === 'credit_override') { const order = orderFor(tenantId, approval.orderId); const customer = customerFor(tenantId, order.customerId); customer.creditLimit = Math.max(customer.creditLimit, customer.creditUsed + order.totalAmount); } mutate(tenantId, actor, 'approval.decided', 'approval', approval.id, before, approval, 'approval.decided'); return clone(approval); }
 
-export function operationSummary(tenantId: string) { tenant(tenantId); const orders = listOrders(tenantId); const invoices = state.invoices.filter(item => item.tenantId === tenantId); const shipments = state.shipments.filter(item => item.tenantId === tenantId); return { tenantId, generatedAt: now(), orderCount: orders.length, byStatus: orders.reduce<Record<string, number>>((acc, item) => { acc[item.status] = (acc[item.status] ?? 0) + 1; return acc; }, {}), grossMerchandiseValue: money(orders.reduce((sum, item) => sum + item.totalAmount, 0)), receivable: money(invoices.reduce((sum, item) => sum + item.total - item.paid, 0)), paid: money(invoices.reduce((sum, item) => sum + item.paid, 0)), delayedShipments: shipments.filter(item => item.status === 'exception').length, pendingApprovals: state.approvals.filter(item => item.tenantId === tenantId && item.status === 'pending').length, inventory: state.inventory.filter(item => item.tenantId === tenantId).map(item => ({ warehouse: item.warehouse, sku: item.sku, available: item.available, reserved: item.reserved, free: item.available - item.reserved })) }; }
+export function operationSummary(tenantId: string) { tenant(tenantId); const orders = listOrders(tenantId); const invoices = state.invoices.filter(item => item.tenantId === tenantId); const shipments = state.shipments.filter(item => item.tenantId === tenantId); const overdue = invoices.map(item => evaluateInvoiceOverdue(tenantId, item, new Date())).filter(item => item.overdue); return { tenantId, generatedAt: now(), orderCount: orders.length, byStatus: orders.reduce<Record<string, number>>((acc, item) => { acc[item.status] = (acc[item.status] ?? 0) + 1; return acc; }, {}), grossMerchandiseValue: money(orders.reduce((sum, item) => sum + item.totalAmount, 0)), receivable: money(invoices.reduce((sum, item) => sum + item.total - item.paid, 0)), paid: money(invoices.reduce((sum, item) => sum + item.paid, 0)), overdueInvoices: overdue.length, overdueAmount: money(overdue.reduce((sum, item) => sum + item.outstanding, 0)), delayedShipments: shipments.filter(item => item.status === 'exception').length, pendingApprovals: state.approvals.filter(item => item.tenantId === tenantId && item.status === 'pending').length, inventory: state.inventory.filter(item => item.tenantId === tenantId).map(item => ({ warehouse: item.warehouse, sku: item.sku, available: item.available, reserved: item.reserved, free: item.available - item.reserved })) }; }
 export function timeline(tenantId: string, orderId: string) { const order = orderFor(tenantId, orderId); const relatedIds = new Set([order.id]); const shipment = state.shipments.find(item => item.orderId === orderId); const customs = state.customs.find(item => item.orderId === orderId); const invoice = state.invoices.find(item => item.orderId === orderId); if (shipment) relatedIds.add(shipment.id); if (customs) relatedIds.add(customs.id); if (invoice) relatedIds.add(invoice.id); state.approvals.filter(item => item.orderId === orderId).forEach(item => relatedIds.add(item.id)); return state.audit.filter(item => item.tenantId === tenantId && relatedIds.has(item.entityId)).sort((a, b) => b.at.localeCompare(a.at)).map(clone); }
 export function listAudit(tenantId: string, limit = 100) { tenant(tenantId); return state.audit.filter(item => item.tenantId === tenantId).slice(0, Math.min(limit, 500)).map(clone); }
 export function listOutbox(tenantId: string, status?: OutboxEvent['status']) { tenant(tenantId); return state.outbox.filter(item => (!status || item.status === status)).map(clone); }
@@ -88,12 +88,49 @@ export function listOrdersPage(tenantId: string, input: { cursor?: string; limit
   const items = ordered.slice(offset, offset + limit).map(clone);
   return { items, nextCursor: offset + limit < ordered.length ? String(offset + limit) : undefined, total: ordered.length };
 }
+// ---- 逾期判定（客户当地日期口径） ----
+// 口径约定：dueDate 的日期部分是客户当地的约定账期日，dueDate 当天仍属宽限期，
+// 只有当 asOf 在客户当地时区下的日历日期晚于 dueDate 日期（即进入次日及以后）时才判定逾期。
+// asOf 到当地日期的换算只通过 Intl（IANA 时区库）完成，绝不读取服务器本地时区，
+// 也不对 asOf 直接截取 UTC 日期；夏令时切换、闰日、历史时区偏移变更均由时区库按 asOf 瞬间解析。
+const DATE_ONLY = /^\d{4}-\d{2}-\d{2}$/;
+function isValidTimeZone(timeZone: string): boolean {
+  try { new Intl.DateTimeFormat('en-US', { timeZone }); return true; } catch { return false; }
+}
+function localDateInZone(instant: Date, timeZone: string): string {
+  const parts = new Intl.DateTimeFormat('en-US', { timeZone, year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(instant);
+  const value = (type: string) => parts.find(part => part.type === type)?.value ?? '';
+  return `${value('year')}-${value('month')}-${value('day')}`;
+}
+export type OverdueEvaluation = { invoiceId: string; status: InvoiceStatus; overdue: boolean; asOf: string; evaluatedDate: string; dueDate: string; customerTimezone: string; evaluatedTimezone: string; timezoneValid: boolean; customerConfigured: boolean; outstanding: number };
+function evaluateInvoiceOverdue(tenantId: string, invoice: Invoice, asOf: Date): OverdueEvaluation {
+  if (Number.isNaN(asOf.getTime())) throw new Error('asOf 评估时间无效');
+  const dueDate = invoice.dueDate.slice(0, 10);
+  if (!DATE_ONLY.test(dueDate)) throw new Error(`发票 ${invoice.number} 的账期日期无效`);
+  // 客户配置可能缺失（订单/客户被清理或从未配置时区）：回退 UTC 并在结果中显式标记，不中断评估。
+  const order = state.orders.find(item => item.id === invoice.orderId && item.tenantId === tenantId);
+  const customer = order ? state.customers.find(item => item.id === order.customerId && item.tenantId === tenantId) : undefined;
+  const configured = customer?.timezone;
+  const timezoneValid = Boolean(configured) && isValidTimeZone(configured!);
+  const evaluatedTimezone = timezoneValid ? configured! : 'UTC';
+  const evaluatedDate = localDateInZone(asOf, evaluatedTimezone);
+  const outstanding = money(invoice.total - invoice.paid);
+  // 与发票状态保持一致：已结清/作废的发票不存在逾期；仅 issued/partially_paid 且仍有未核销余额时才可能逾期。
+  const overdue = (invoice.status === 'issued' || invoice.status === 'partially_paid') && outstanding > 0 && evaluatedDate > dueDate;
+  return { invoiceId: invoice.id, status: invoice.status, overdue, asOf: asOf.toISOString(), evaluatedDate, dueDate, customerTimezone: configured ?? 'UTC', evaluatedTimezone, timezoneValid, customerConfigured: Boolean(customer), outstanding };
+}
 export function invoiceOverdue(tenantId: string, invoiceId: string, asOf = new Date()) {
   const invoice = assertTenant(state.invoices.find(item => item.id === invoiceId) ?? (() => { throw new Error('发票不存在'); })(), tenantId);
-  const order = orderFor(tenantId, invoice.orderId);
-  const customer = customerFor(tenantId, order.customerId);
-  const customerDate = asOf.toISOString().slice(0, 10);
-  return { invoiceId, overdue: customerDate > invoice.dueDate.slice(0, 10), evaluatedDate: customerDate, customerTimezone: customer.timezone ?? 'UTC' };
+  return evaluateInvoiceOverdue(tenantId, invoice, asOf);
+}
+// 批量逾期扫描：逾期是派生结论而非持久化状态，扫描不写回 invoice.status，
+// 因此同一 asOf 重复扫描结果完全一致，不会来回翻转；每次扫描留一条 audit 便于核对。
+export function scanOverdueInvoices(tenantId: string, asOf = new Date(), actor = 'system') {
+  tenant(tenantId);
+  const items = state.invoices.filter(item => item.tenantId === tenantId).map(invoice => evaluateInvoiceOverdue(tenantId, invoice, asOf));
+  const overdueIds = items.filter(item => item.overdue).map(item => item.invoiceId);
+  record(tenantId, actor, 'invoice.overdue.scanned', 'invoice', 'batch', undefined, { asOf: asOf.toISOString(), scanned: items.length, overdue: overdueIds });
+  return { asOf: asOf.toISOString(), scanned: items.length, overdueCount: overdueIds.length, items };
 }
 
 // seed a coherent flow for demos: one order is allocated, one customs declaration is cleared, and one invoice is partially paid.

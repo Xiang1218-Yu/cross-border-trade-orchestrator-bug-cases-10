@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { URL } from 'node:url';
 import {
-  addShipmentEvent, allocateOrder, cancelOrder, closeOrder, confirmOrder, createApproval, createCustomsDeclaration, createOrder, decideApproval, deliverOrder, dispatchOrder, generateInvoice, getOrder, invoiceOverdue, listAudit, listOrders, listOrdersPage, listOutbox, operationSummary, publishOutbox, recordPayment, state, timeline, updateCustoms
+  addShipmentEvent, allocateOrder, cancelOrder, closeOrder, confirmOrder, createApproval, createCustomsDeclaration, createOrder, decideApproval, deliverOrder, dispatchOrder, generateInvoice, getOrder, invoiceOverdue, listAudit, listOrders, listOrdersPage, listOutbox, operationSummary, publishOutbox, recordPayment, scanOverdueInvoices, state, timeline, updateCustoms
 } from './domain.js';
 
 const port = Number(process.env.PORT ?? 4120);
@@ -42,6 +42,7 @@ const server = createServer(async (req, res) => {
     if (method === 'POST' && path === '/api/payments') return success(res, recordPayment(tenant, await readBody(req), user), 201);
     const invoiceId = path.match(/^\/api\/invoices\/([^/]+)\/overdue$/)?.[1];
     if (method === 'GET' && invoiceId) return success(res, invoiceOverdue(tenant, invoiceId, url.searchParams.get('asOf') ? new Date(String(url.searchParams.get('asOf'))) : new Date()));
+    if (method === 'POST' && path === '/api/invoices/overdue/scan') { const body = await readBody(req); return success(res, scanOverdueInvoices(tenant, body.asOf ? new Date(String(body.asOf)) : new Date(), user)); }
     if (method === 'POST' && path === '/api/approvals') return success(res, createApproval(tenant, await readBody(req), user), 201);
     const approvalId = path.match(/^\/api\/approvals\/([^/]+)\/decision$/)?.[1];
     if (method === 'POST' && approvalId) return success(res, decideApproval(tenant, approvalId, await readBody(req), user));
