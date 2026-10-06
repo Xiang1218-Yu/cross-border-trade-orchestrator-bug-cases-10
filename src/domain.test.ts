@@ -12,7 +12,7 @@ test('order lifecycle preserves credit, inventory, customs, shipment and invoice
   updateCustoms('tenant-acme', declaration.id, { status: 'cleared' }, 'tester');
   const dispatched = dispatchOrder('tenant-acme', order.id, 'tester');
   assert.equal(dispatched.status, 'dispatched');
-  const invoice = generateInvoice('tenant-acme', order.id, 'tester');
+  const invoice = generateInvoice('tenant-acme', order.id, {}, 'tester');
   assert.ok(invoice.total > invoice.subtotal);
   recordPayment('tenant-acme', { invoiceId: invoice.id, amount: invoice.total, method: 'bank_transfer', reference: `PAY-${Date.now()}` }, 'tester');
   assert.equal(state.invoices.find(item => item.id === invoice.id)?.status, 'paid');
